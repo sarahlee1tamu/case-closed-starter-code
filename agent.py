@@ -6,7 +6,7 @@ from collections import deque
 
 from case_closed_game import Game, Direction, GameResult
 
-# Flask API server setup
+# Flask API server setup wahhh
 app = Flask(__name__)
 
 GLOBAL_GAME = Game()

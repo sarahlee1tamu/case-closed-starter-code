@@ -1,2 +1,5 @@
 Flask
 requests
+torch
+numpy
+pygame

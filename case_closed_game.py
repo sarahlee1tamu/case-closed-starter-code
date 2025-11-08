@@ -18,18 +18,13 @@ class GameBoard:
         self.width = width
         self.grid = [[EMPTY for _ in range(width)] for _ in range(height)]
 
-    def _torus_check(self, position: tuple[int, int]) -> tuple[int, int]:
-        x, y = position
-        normalized_x = x % self.width
-        normalized_y = y % self.height
-        return (normalized_x, normalized_y)
-    
+
     def get_cell_state(self, position: tuple[int, int]) -> int:
-        x, y = self._torus_check(position)
+        x, y = position
         return self.grid[y][x]
 
     def set_cell_state(self, position: tuple[int, int], state: int):
-        x, y = self._torus_check(position)
+        x, y = position
         self.grid[y][x] = state
 
     def get_random_empty_cell(self) -> tuple[int, int] | None:
@@ -125,7 +120,10 @@ class Agent:
             dx, dy = direction.value
             new_head = (head[0] + dx, head[1] + dy)
             
-            new_head = self.board._torus_check(new_head)
+            # Check if the new head is out of bounds
+            if not (0 <= new_head[0] < self.board.width and 0 <= new_head[1] < self.board.height):
+                self.alive = False
+                return False
             
             cell_state = self.board.get_cell_state(new_head)
             

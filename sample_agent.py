@@ -1,154 +1,224 @@
 """
-Sample agent for Case Closed Challenge - Works with Judge Protocol
-This agent runs as a Flask server and responds to judge requests.
+Smarter sample_agent for Case Closed – Flask server that follows the Judge Protocol.
+- Avoids immediate crashes (your trail, opponent trail, board walls via torus wrap handled).
+- Chooses the move that maximizes reachable open space (1-step lookahead flood-fill).
+- Dodges head-on collisions when disadvantaged by length.
+- Uses BOOST sparingly: when we're funneled (only one safe move) or when boost increases safe space.
 """
-
 import os
-from flask import Flask, request, jsonify
+from typing import List, Tuple, Dict, Any, Set
 from collections import deque
+
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Basic identity
+# Identity (used by local tools/judge UI)
 PARTICIPANT = os.getenv("PARTICIPANT", "SampleParticipant")
-AGENT_NAME = os.getenv("AGENT_NAME", "SampleAgent")
+AGENT_NAME  = os.getenv("AGENT_NAME",  "SampleAgentPlus")
 
-# Track game state
-game_state = {
-    "board": None,
-    "agent1_trail": [],
-    "agent2_trail": [],
-    "agent1_length": 0,
-    "agent2_length": 0,
-    "agent1_alive": True,
-    "agent2_alive": True,
-    "agent1_boosts": 3,
-    "agent2_boosts": 3,
-    "turn_count": 0,
-    "player_number": 1,
+# -----------------------------------------------------------------------------
+#State cache (the judge POSTs /send-state each turn before /send-move)
+# -----------------------------------------------------------------------------
+game_state: Dict[str, Any] = {}
+
+# Grid helpers
+DIRS = {
+    "UP":    (0, -1),
+    "DOWN":  (0,  1),
+    "LEFT":  (-1, 0),
+    "RIGHT": (1,  0),
 }
+ORDERED_DIRS = ["UP", "RIGHT", "DOWN", "LEFT"]  # tie-break order (clockwise)
+OPPOSITE = {"UP":"DOWN","DOWN":"UP","LEFT":"RIGHT","RIGHT":"LEFT"}
+
+
+def dims(board: List[List[int]]) -> Tuple[int,int]:
+    H = len(board)
+    W = len(board[0]) if H else 0
+    return W, H
+
+
+def wrap(x: int, y: int, W: int, H: int) -> Tuple[int,int]:
+    return x % W, y % H
+
+
+def step(pos: Tuple[int,int], dir_str: str, W: int, H: int) -> Tuple[int,int]:
+    dx, dy = DIRS[dir_str]
+    return wrap(pos[0] + dx, pos[1] + dy, W, H)
+
+
+def occupied_from_board(board: List[List[int]]) -> Set[Tuple[int,int]]:
+    occ = set()
+    H = len(board)
+    for y in range(H):
+        row = board[y]
+        for x, v in enumerate(row):
+            if v == 1:  # AGENT cells
+                occ.add((x,y))
+    return occ
+
+
+def reachable_size(start: Tuple[int,int], occ: Set[Tuple[int,int]], W:int, H:int, limit:int=400) -> int:
+    """Flood fill counting free cells reachable from start (up to an upper limit to keep it fast)."""
+    if start in occ:
+        return 0
+    q = deque([start])
+    seen = {start}
+    count = 0
+    while q and count < limit:
+        x,y = q.popleft()
+        count += 1
+        for dir_str in ORDERED_DIRS:
+            nx, ny = step((x,y), dir_str, W, H)
+            if (nx,ny) not in occ and (nx,ny) not in seen:
+                seen.add((nx,ny))
+                q.append((nx,ny))
+    return count
+
+
+def head_on_is_bad(my_len:int, opp_len:int) -> bool:
+    """Return True if a head-on tie would be bad for us (we lose ties or when shorter)."""
+    # In this competition build: longer trail survives head-on; equal length often kills both.
+    # Treat tie as bad/risky for the sample bot.
+    return opp_len >= my_len
+
+
+def choose_dir_safe(board, my_trail, opp_trail, my_len, opp_len, cur_dir, boosts_left) -> Tuple[str,bool]:
+    """Pick a direction and whether to use BOOST."""
+    if not my_trail:
+        return "RIGHT", False
+
+    W,H = dims(board)
+    occ = occupied_from_board(board)
+
+    my_head = my_trail[-1]
+    opp_head = opp_trail[-1] if opp_trail else None
+
+    # Build candidate directions (avoid instant self-reverse; judge would correct it, but we filter anyway)
+    candidates = [d for d in ORDERED_DIRS if d != OPPOSITE.get(cur_dir)]
+    # Filter: cannot move into occupied cell on the first step
+    first_step_ok = []
+    for d in candidates:
+        n1 = step(my_head, d, W, H)
+        if n1 in occ:
+            continue
+        # Head-on avoidance: if opponent is adjacent and moving into their head cell would be a tie/bad, avoid
+        if opp_head and n1 == opp_head and head_on_is_bad(my_len, opp_len):
+            continue
+        first_step_ok.append(d)
+
+    if not first_step_ok:
+        # If everything is blocked, fall back to any candidate (judge will handle invalid opposite)
+        return candidates[0], False
+
+    # Score each by reachable space after moving there.
+    scored = []
+    for d in first_step_ok:
+        n1 = step(my_head, d, W, H)
+        occ1 = set(occ)
+        occ1.add(n1)  # our trail occupies after we move
+        space1 = reachable_size(n1, occ1, W, H)
+
+        # Optional: estimate benefit of BOOST (two steps) only if we have boosts
+        boost_gain = 0
+        if boosts_left > 0:
+            n2 = step(n1, d, W, H)
+            if n2 not in occ1:
+                occ2 = set(occ1)
+                occ2.add(n2)
+                space2 = reachable_size(n2, occ2, W, H)
+                boost_gain = max(0, space2 - space1)  # added safe space by stepping twice
+
+        # Distance from opponent head (prefer farther when close)
+        dist_opp = 0
+        if opp_head:
+            ox, oy = opp_head
+            dx = min((n1[0]-ox) % W, (ox-n1[0]) % W)
+            dy = min((n1[1]-oy) % H, (oy-n1[1]) % H)
+            dist_opp = dx + dy
+
+        scored.append((space1, boost_gain, dist_opp, -ORDERED_DIRS.index(d), d))
+
+    # Choose by max tuple (space, boost_gain, dist_opp, tiebreak by fixed order)
+    scored.sort(reverse=True)
+    best_space, best_boost_gain, _, _, best_dir = scored[0]
+
+    # Use BOOST if:
+    # - we only have one safe move (escaping a corridor), OR
+    # - boost increases reachable space noticeably
+    use_boost = False
+    if boosts_left > 0:
+        if len(first_step_ok) == 1:
+            use_boost = True
+        elif best_boost_gain >= 6:  # heuristic threshold
+            use_boost = True
+
+    return best_dir, use_boost
 
 
 @app.route("/", methods=["GET"])
-def info():
-    """Basic health/info endpoint used by the judge to check connectivity."""
+def index():
     return jsonify({"participant": PARTICIPANT, "agent_name": AGENT_NAME}), 200
 
 
 @app.route("/send-state", methods=["POST"])
-def receive_state():
-    """Judge calls this to push the current game state to the agent server."""
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "no json body"}), 400
-    
-    # Update our local game state
+def send_state():
+    data = request.get_json(silent=True) or {}
+    # Keep only expected keys; tolerate extras
+    game_state.clear()
     game_state.update(data)
-    
-    return jsonify({"status": "state received"}), 200
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/send-move", methods=["GET"])
 def send_move():
-    """Judge calls this (GET) to request the agent's move for the current tick.
-    
-    Return format: {"move": "DIRECTION"} or {"move": "DIRECTION:BOOST"}
-    """
-    player_number = request.args.get("player_number", default=1, type=int)
-    turn_count = game_state.get("turn_count", 0)
-    
-    # Get our current state
-    if player_number == 1:
-        my_trail = game_state.get("agent1_trail", [])
-        my_boosts = game_state.get("agent1_boosts", 3)
-        other_trail = game_state.get("agent2_trail", [])
+    # Pull state pushed on previous /send-state
+    board = game_state.get("board", [])
+    pnum  = request.args.get("player_number", type=int) or game_state.get("player_number", 1)
+    turn  = request.args.get("turn_count", type=int) or game_state.get("turn_count", 0)
+
+    if pnum == 1:
+        my_trail   = game_state.get("agent1_trail", [])
+        opp_trail  = game_state.get("agent2_trail", [])
+        my_len     = game_state.get("agent1_length", 1)
+        opp_len    = game_state.get("agent2_length", 1)
+        my_boosts  = game_state.get("agent1_boosts", 3)
     else:
-        my_trail = game_state.get("agent2_trail", [])
-        my_boosts = game_state.get("agent2_boosts", 3)
-        other_trail = game_state.get("agent1_trail", [])
-    
-    # Simple decision logic
-    move = decide_move(my_trail, other_trail, turn_count, my_boosts)
-    
-    return jsonify({"move": move}), 200
+        my_trail   = game_state.get("agent2_trail", [])
+        opp_trail  = game_state.get("agent1_trail", [])
+        my_len     = game_state.get("agent2_length", 1)
+        opp_len    = game_state.get("agent1_length", 1)
+        my_boosts  = game_state.get("agent2_boosts", 3)
+
+    # Determine current direction from last two trail points if available; default RIGHT
+    cur_dir = "RIGHT"
+    if len(my_trail) >= 2:
+        (x1,y1),(x2,y2) = my_trail[-2], my_trail[-1]
+        W,H = dims(board) if board else (20,18)
+        # Choose the non-wrapped delta (torus shortest move)
+        dx = (x2 - x1 + W) % W
+        dy = (y2 - y1 + H) % H
+        if dx == 0 and dy == 0:
+            pass
+        else:
+            if dx == 1 or dx == (W-1):
+                cur_dir = "RIGHT" if dx == 1 else "LEFT"
+            elif dy == 1 or dy == (H-1):
+                cur_dir = "DOWN" if dy == 1 else "UP"
+
+    move_dir, want_boost = choose_dir_safe(board, my_trail, opp_trail, my_len, opp_len, cur_dir, my_boosts)
+
+    return jsonify({"move": f"{move_dir}:BOOST" if want_boost else move_dir}), 200
 
 
 @app.route("/end", methods=["POST"])
-def end_game():
-    """Judge notifies agent that the match finished and provides final state."""
-    data = request.get_json()
-    if data:
-        result = data.get("result", "UNKNOWN")
-        print(f"\nGame Over! Result: {result}")
-    return jsonify({"status": "acknowledged"}), 200
-
-
-def decide_move(my_trail, other_trail, turn_count, my_boosts):
-    """Simple decision logic for the agent.
-    
-    Strategy:
-    - Move in a direction that doesn't immediately hit a trail
-    - Use boost if we have them and it's mid-game (turns 30-80)
-    """
-    if not my_trail:
-        return "RIGHT"
-    
-    # Get current head position and direction
-    head = my_trail[-1] if my_trail else (0, 0)
-    
-    # Calculate current direction if we have at least 2 positions
-    current_dir = "RIGHT"
-    if len(my_trail) >= 2:
-        prev = my_trail[-2]
-        dx = head[0] - prev[0]
-        dy = head[1] - prev[1]
-        
-        # Normalize for torus wrapping
-        if abs(dx) > 1:
-            dx = -1 if dx > 0 else 1
-        if abs(dy) > 1:
-            dy = -1 if dy > 0 else 1
-        
-        if dx == 1:
-            current_dir = "RIGHT"
-        elif dx == -1:
-            current_dir = "LEFT"
-        elif dy == 1:
-            current_dir = "DOWN"
-        elif dy == -1:
-            current_dir = "UP"
-    
-    # Simple strategy: try to avoid trails, prefer continuing straight
-    # Check available directions (not opposite to current)
-    directions = ["UP", "DOWN", "LEFT", "RIGHT"]
-    opposite = {"UP": "DOWN", "DOWN": "UP", "LEFT": "RIGHT", "RIGHT": "LEFT"}
-    
-    # Remove opposite direction
-    if current_dir in opposite:
-        try:
-            directions.remove(opposite[current_dir])
-        except ValueError:
-            pass
-    
-    # Prefer current direction if still available
-    if current_dir in directions:
-        chosen_dir = current_dir
-    else:
-        # Pick first available
-        chosen_dir = directions[0] if directions else "RIGHT"
-    
-    # Decide whether to use boost
-    # Use boost in mid-game when we still have them
-    use_boost = my_boosts > 0 and 30 <= turn_count <= 80
-    
-    if use_boost:
-        return f"{chosen_dir}:BOOST"
-    else:
-        return chosen_dir
+def end():
+    # Optional place to log results/reset
+    return jsonify({"ok": True}), 200
 
 
 if __name__ == "__main__":
-    # For development only. Port can be overridden with the PORT env var.
     port = int(os.environ.get("PORT", "5009"))
-    print(f"Starting {AGENT_NAME} ({PARTICIPANT}) on port {port}...")
+    print(f"[{AGENT_NAME}] starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -18,7 +18,7 @@ _DEBUGGED_FIRST_STATE = False
 # --------------------------------------------------------------------------------------
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "5008"))
-MODEL_PATH = os.environ.get("MODEL_PATH", "training/models/dqn.pt")
+MODEL_PATH = os.environ.get("MODEL_PATH", "dqn_1035000.pt")
 
 print(f"[agent] Loading model from {MODEL_PATH}")
 

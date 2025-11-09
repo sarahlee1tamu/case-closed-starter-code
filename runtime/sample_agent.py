@@ -1,4 +1,6 @@
 # runtime/sample_agent.py
+import os
+import glob
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,6 +14,21 @@ GRID_HEIGHT = 18
 device = torch.device("cpu")
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+
+def find_latest_model():
+    # First, try to find models in the training directory (for local testing)
+    search_path = os.path.join("../training", 'model*.pth')
+    files = glob.glob(search_path)
+    
+    if files:
+        # Found models in ../training, use the latest one
+        return max(files, key=os.path.getmtime)
+    
+    # If not found, fall back to model.pth in the current directory (for Docker runtime)
+    if os.path.exists('model_20251108_184615.pth'):
+        return 'model_20251108_184615.pth'
+        
+    return None
 
 # ----------------- Model -----------------
 class DQN(nn.Module):
@@ -31,7 +48,20 @@ class DQN(nn.Module):
 class AgentHelper:
     def __init__(self):
         self.policy_net = DQN().to(device)
-        self.policy_net.load_state_dict(torch.load('model.pth', map_location="cpu"))
+        latest_model_path = find_latest_model()
+
+        if latest_model_path:
+            print(f"Loading latest model from {latest_model_path}")
+            checkpoint = torch.load(latest_model_path, map_location="cpu")
+            if isinstance(checkpoint, dict) and 'policy_state_dict' in checkpoint:
+                self.policy_net.load_state_dict(checkpoint['policy_state_dict'])
+                print("Loaded full checkpoint (policy_state_dict).")
+            else:
+                self.policy_net.load_state_dict(checkpoint)
+                print("Loaded old model format (state_dict only).")
+        else:
+            print("No model found. Using untrained model.")
+        
         self.policy_net.eval()
         self.action_map = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
 

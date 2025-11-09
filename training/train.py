@@ -6,6 +6,7 @@ import time
 import random
 import argparse
 from collections import deque
+import datetime
 
 import numpy as np
 import torch
@@ -264,6 +265,13 @@ def simple_opponent_action(game):
 # -----------------
 # Trainer
 # -----------------
+
+def find_latest_model(base_name="model"):
+    files = [f for f in os.listdir() if f.startswith(base_name) and f.endswith(".pth")]
+    if not files:
+        return None
+    return max(files, key=os.path.getctime)
+
 class Trainer:
     def __init__(self, args):
         self.gamma = 0.99
@@ -282,6 +290,25 @@ class Trainer:
 
         self.opt = optim.Adam(self.policy.parameters(), lr=self.lr)
         self.loss_fn = nn.MSELoss()
+        self.start_ep = 0
+
+        latest = find_latest_model("model")
+        if latest:
+            print(f"Resuming training from {latest}")
+            checkpoint = torch.load(latest, map_location=DEVICE)
+            if 'policy_state_dict' in checkpoint:
+                self.policy.load_state_dict(checkpoint['policy_state_dict'])
+                self.target.load_state_dict(checkpoint['target_state_dict'])
+                self.opt.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.eps = checkpoint.get('epsilon', self.eps)
+                self.start_ep = checkpoint.get('episode', 0)
+                print("Loaded full checkpoint.")
+            else:
+                self.policy.load_state_dict(checkpoint)
+                self.target.load_state_dict(self.policy.state_dict())
+                print("Loaded old model format (weights only). Training state will be reset.")
+        else:
+            print("No existing model found, starting fresh.")
 
         self.visualize = args.viz and HAS_PYGAME
         if self.visualize:
@@ -375,7 +402,7 @@ class Trainer:
 
     def train(self, episodes, save_path):
         print(f"Training for {episodes} episodes on CPU…")
-        for ep in range(1, episodes+1):
+        for ep in range(self.start_ep + 1, self.start_ep + episodes + 1):
             game = Game()
             total_reward = 0.0
             done = False
@@ -456,13 +483,32 @@ class Trainer:
                 print(f"[Ep {ep:4d}] avgR(100)={avg_r:6.2f} win(100)={wr:5.1%} eps={self.eps:.3f}")
 
             # Periodic save
-            if ep % 100 == 0:
-                torch.save(self.policy.state_dict(), save_path)
-                print(f"Saved checkpoint -> {save_path}")
+            if ep % 500 == 0:
+                checkpoint = {
+                    'policy_state_dict': self.policy.state_dict(),
+                    'target_state_dict': self.target.state_dict(),
+                    'optimizer_state_dict': self.opt.state_dict(),
+                    'epsilon': self.eps,
+                    'episode': ep
+                }
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_name = f"{os.path.splitext(save_path)[0]}_{timestamp}.pth"
+                torch.save(checkpoint, save_name)
+                print(f"✅ Full checkpoint saved -> {save_name}")
 
         # Final save
-        torch.save(self.policy.state_dict(), save_path)
-        print(f"Training complete. Model saved -> {save_path}")
+        checkpoint = {
+            'policy_state_dict': self.policy.state_dict(),
+            'target_state_dict': self.target.state_dict(),
+            'optimizer_state_dict': self.opt.state_dict(),
+            'epsilon': self.eps,
+            'episode': ep
+        }
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_name = f"{os.path.splitext(save_path)[0]}_{timestamp}.pth"
+        torch.save(checkpoint, save_name)
+        print(f"✅ Training complete. Full checkpoint saved as {save_name}")
+
 
         if self.visualize and HAS_PYGAME:
             pygame.quit()

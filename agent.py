@@ -62,7 +62,7 @@ def count_open_neighbors(r, c, board, rows=GRID_HEIGHT, cols=GRID_WIDTH):
 def manhattan_distance(r1, c1, r2, c2): return abs(r1-r2)+abs(c1-c2)
 
 class TronAgent:
-    def __init__(self, model_path='model.pth'):
+    def __init__(self, model_path='model_20251108_184615.pth'):
         self.model = DQN().to(device)
         if os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=device))
